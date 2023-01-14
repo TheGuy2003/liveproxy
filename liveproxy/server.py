@@ -1,17 +1,11 @@
-import base64
-import errno
-import logging
 import os
-import re
 import shlex
-import socket
-import subprocess
-import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from shutil import which
 from socketserver import ThreadingMixIn
 from time import time
 from urllib.parse import unquote
+from functools import lru_cache
 
 ACCEPTABLE_ERRNO = (
     errno.ECONNABORTED,
@@ -19,19 +13,19 @@ ACCEPTABLE_ERRNO = (
     errno.EINVAL,
     errno.EPIPE,
 )
-try:
+if os.name == 'nt':
     ACCEPTABLE_ERRNO += (errno.WSAECONNABORTED,)
-except AttributeError:
-    pass  # Not windows
 
 _re_streamlink = re.compile(r"streamlink", re.IGNORECASE)
 _re_youtube_dl = re.compile(r"(?:youtube|yt)[_-]dl(?:p)?", re.IGNORECASE)
 
 log = logging.getLogger(__name__.replace("liveproxy.", ""))
 
+@lru_cache()
+def find_executable(name):
+    return which(name, mode=os.F_OK | os.X_OK)
 
 class HTTPRequest(BaseHTTPRequestHandler):
-
     def log_message(self, format, *args):
         pass
 
@@ -59,18 +53,14 @@ class HTTPRequest(BaseHTTPRequestHandler):
         log.info(f"Client: {self.client_address}")
         log.info(f"Address: {self.address_string()}")
 
-        if self.path.startswith(("/base64/")):
-            # http://127.0.0.1:53422/base64/STREAMLINK-COMMANDS/
-            # http://127.0.0.1:53422/base64/YOUTUBE-DL-COMMANDS/
-            # http://127.0.0.1:53422/base64/YT-DLP-COMMANDS/
+        if self.path.startswith("/base64/"):
             try:
                 arglist = shlex.split(base64.urlsafe_b64decode(self.path.split("/")[2]).decode("UTF-8"))
             except base64.binascii.Error as err:
                 log.error(f"invalid base64 URL: {err}")
                 self._headers(404, "text/html", connection="close")
                 return
-        elif self.path.startswith(("/cmd/")):
-            # http://127.0.0.1:53422/cmd/streamlink https://example best/
+        elif self.path.startswith("/cmd/"):
             self.path = self.path[5:]
             if self.path.endswith("/"):
                 self.path = self.path[:-1]
@@ -79,7 +69,7 @@ class HTTPRequest(BaseHTTPRequestHandler):
             self._headers(404, "text/html", connection="close")
             return
 
-        prog = which(arglist[0], mode=os.F_OK | os.X_OK)
+        prog = find_executable(arglist[0])
         if not prog:
             log.error(f"invalid prog, can not find '{arglist[0]}' on your system")
             return
@@ -88,63 +78,34 @@ class HTTPRequest(BaseHTTPRequestHandler):
         if _re_streamlink.search(prog):
             arglist.extend(["--stdout", "--loglevel", "none"])
         elif _re_youtube_dl.search(prog):
-            arglist.extend(["-o", "-", "--quiet", "--no-playlist", "--no-warnings", "--no-progress"])
+            arglist.extend(["-o", "-"])
         else:
-            log.error("Video-Software is not supported.")
             self._headers(404, "text/html", connection="close")
             return
 
-        log.debug(f"{arglist!r}")
-        self._headers(200, "video/unknown")
-        process = subprocess.Popen(arglist,
-                                   stderr=subprocess.PIPE,
-                                   stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE,
-                                   shell=False,
-                                   )
-
-        log.info(f"Stream started {random_id}")
+        log.debug(f"arglist: {arglist}")
         try:
-             while True:
-                read = process.stdout.readline()
-                if read:
-                    self.wfile.write(read)
-                sys.stdout.flush()
-                if process.poll() is not None:
-                    self.wfile.close()
-                    break
-        except socket.error as e:
-            if isinstance(e.args, tuple):
-                if not e.errno in ACCEPTABLE_ERRNO:
-                    log.error(f"E1: {e!r}")
-            else:
-                log.error(f"E2: {e!r}")
+            output = subprocess.run(arglist, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception as ex:
+            log.error(f"Failed to run {prog} {arglist} {ex}")
+            self._headers(404, "text/html", connection="close")
+            return
 
-        log.info(f"Stream ended {random_id}")
-        process.terminate()
-        process.wait()
-        process.kill()
+        self._headers(200, "application/octet-stream")
+        self.wfile.write(output.stdout)
 
+class ThreadingServer(ThreadingMixIn, HTTPServer):
+    pass
 
-class Server(HTTPServer):
-    """HTTPServer class with timeout."""
-    timeout = 5
+def main(port=0):
+    server = ThreadingServer(("", port), HTTPRequest)
+    log.info(f"Listening on {server.server_address[1]}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
+        server.shutdown()
+        server.server_close()
 
-    def finish_request(self, request, client_address):
-        """Finish one request by instantiating RequestHandlerClass."""
-        try:
-            self.RequestHandlerClass(request, client_address, self)
-        except ValueError:
-            pass
-        except socket.error as err:
-            if err.errno not in ACCEPTABLE_ERRNO:
-                raise
-
-
-class ThreadedHTTPServer(ThreadingMixIn, Server):
-    """Handle requests in a separate thread."""
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-__all__ = ("HTTPRequest", "ThreadedHTTPServer")
+if __name__ == "__main__":
+    main()
